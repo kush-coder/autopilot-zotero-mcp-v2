@@ -1,0 +1,228 @@
+"""Regression tests for annotation coordinate conversion (real PyMuPDF).
+
+Zotero stores annotation rects in the PDF's native user space (MediaBox
+lower-left origin), while PyMuPDF search results live in a CropBox-normalized
+space with a (0, 0) origin. These tests assert that find_text_position and
+build_area_position_data map coordinates back to user space via the inverse
+page transformation matrix, covering PDFs whose page box origin is not (0, 0).
+"""
+
+import os
+import tempfile
+
+import pytest
+
+from zotero_mcp.pdf_utils import build_area_position_data, find_text_position, text_in_rects
+
+SENTENCE = "judgmental anchoring has durable effects lasting up to one week"
+
+# Page boxes from the reproduction case (Furnham & Boo 2011):
+# MediaBox [41.9, 46.5, 637.2, 840.2], CropBox [41.9, 0, 637.2, 793.7].
+OFFSET_MEDIABOX = (41.9, 46.5, 637.2, 840.2)
+
+
+def _make_pdf(tmpdir, mediabox=None, name="test.pdf"):
+    """Create a one-page PDF containing SENTENCE, return (path, reference_rects).
+
+    reference_rects are the search_for results mapped through the inverse
+    transformation matrix, i.e. the expected user-space rects.
+    """
+    import fitz
+
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    if mediabox is not None:
+        page.set_mediabox(fitz.Rect(*mediabox))
+    page.insert_text(fitz.Point(72, 100), SENTENCE, fontsize=11)
+
+    inv = ~page.transformation_matrix
+    reference_rects = [
+        [round(v, 4) for v in (r * inv)]
+        for r in page.search_for(SENTENCE)
+    ]
+    assert reference_rects, "test PDF must contain the search text"
+
+    path = os.path.join(tmpdir, name)
+    doc.save(path)
+    doc.close()
+    return path, reference_rects
+
+
+def _assert_rects_close(rects, reference_rects, tolerance=1.0):
+    assert len(rects) == len(reference_rects)
+    for rect, reference in zip(rects, reference_rects):
+        assert rect == pytest.approx(reference, abs=tolerance)
+
+
+@pytest.mark.parametrize("mediabox", [None, OFFSET_MEDIABOX])
+def test_find_text_position_returns_user_space_rects(mediabox):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path, reference_rects = _make_pdf(tmpdir, mediabox=mediabox)
+
+        result = find_text_position(path, 1, SENTENCE)
+
+        assert "error" not in result
+        assert result["pageIndex"] == 0
+        _assert_rects_close(result["rects"], reference_rects)
+
+
+def test_find_text_position_offset_mediabox_includes_origin():
+    """The stored rect must be translated by the MediaBox origin (41.9, 46.5)
+    relative to what the CropBox-normalized conversion would produce."""
+    import fitz
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path, _ = _make_pdf(tmpdir, mediabox=OFFSET_MEDIABOX)
+
+        doc = fitz.open(path)
+        page = doc[0]
+        pymupdf_rect = page.search_for(SENTENCE)[0]
+        crop_height = page.rect.height
+        doc.close()
+
+        result = find_text_position(path, 1, SENTENCE)
+        rect = result["rects"][0]
+
+        assert rect[0] == pytest.approx(pymupdf_rect.x0 + 41.9, abs=1.0)
+        assert rect[2] == pytest.approx(pymupdf_rect.x1 + 41.9, abs=1.0)
+        assert rect[1] == pytest.approx(
+            (crop_height - pymupdf_rect.y1) + 46.5, abs=1.0
+        )
+        assert rect[3] == pytest.approx(
+            (crop_height - pymupdf_rect.y0) + 46.5, abs=1.0
+        )
+
+        # Sort index: page | character offset | page height minus the rect's top.
+        page_part, offset_part, top_part = result["sort_index"].split("|")
+        assert page_part == "00000"
+        assert offset_part == "000000"  # SENTENCE is the page's only text
+        assert int(top_part) == int(crop_height - rect[3])
+
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+@pytest.mark.parametrize(
+    "mediabox, cropbox",
+    [(None, (27, 27, 585, 765)), (OFFSET_MEDIABOX, None)],
+    ids=["cropbox-offset", "mediabox-offset"],
+)
+def test_find_text_position_rotated_page_keeps_box_origin(rotation, mediabox, cropbox):
+    """On a /Rotate page PyMuPDF's transformation_matrix drops a page box
+    origin that is not (0, 0), so its inverse put highlights off by that
+    offset. Rotating a page does not move its content in PDF user space, so
+    the rects must equal those of the unrotated page."""
+    import fitz
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path, reference_rects = _make_pdf(tmpdir, mediabox=mediabox)
+        doc = fitz.open(path)
+        if cropbox is not None:
+            doc[0].set_cropbox(fitz.Rect(*cropbox))
+        doc[0].set_rotation(rotation)
+        doc.saveIncr()
+        doc.close()
+
+        result = find_text_position(path, 1, SENTENCE)
+
+        assert "error" not in result
+        _assert_rects_close(result["rects"], reference_rects)
+        assert text_in_rects(path, 0, result["rects"]) == SENTENCE
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [[SENTENCE], ["judgmental anchoring has durable", "effects lasting up to one week"]],
+    ids=["one-line", "two-lines"],
+)
+def test_find_text_position_highlights_repeated_quote_once(lines):
+    """page.search_for returns every occurrence of the quote; a quote that
+    appears twice on a page must be highlighted once, at the first
+    occurrence, and only over the quote's own words."""
+    import fitz
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        doc = fitz.open()
+        page = doc.new_page(width=612, height=792)
+        for top in (100, 400):
+            page.insert_text(fitz.Point(72, top), "Before. " + lines[0], fontsize=11)
+            for i, line in enumerate(lines[1:], start=1):
+                page.insert_text(fitz.Point(72, top + 20 * i), line + " After.", fontsize=11)
+        path = os.path.join(tmpdir, "repeated.pdf")
+        doc.save(path)
+        doc.close()
+
+        result = find_text_position(path, 1, SENTENCE)
+
+        assert "error" not in result
+        assert len(result["rects"]) == len(lines)
+        assert all(rect[1] > 792 - 200 for rect in result["rects"])  # the first occurrence
+        assert text_in_rects(path, 0, result["rects"]) == SENTENCE
+
+
+def test_build_area_position_offset_mediabox():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path, _ = _make_pdf(tmpdir, mediabox=OFFSET_MEDIABOX)
+
+        result = build_area_position_data(path, 1, 0.1, 0.2, 0.3, 0.4)
+
+        assert "error" not in result
+        (rect,) = result["rects"]
+
+        # Fractions are relative to the visible page (CropBox, 595.3 x 793.7);
+        # the stored rect adds the MediaBox origin: x + 41.9, y -> 840.2 - y.
+        crop_w, crop_h = 637.2 - 41.9, 793.7
+        assert rect[0] == pytest.approx(0.1 * crop_w + 41.9, abs=0.01)
+        assert rect[2] == pytest.approx(0.4 * crop_w + 41.9, abs=0.01)
+        assert rect[3] == pytest.approx(840.2 - 0.2 * crop_h, abs=0.01)
+        assert rect[1] == pytest.approx(840.2 - 0.6 * crop_h, abs=0.01)
+
+
+def test_build_area_position_rotated_page():
+    """On a /Rotate 90 page the rect is normalized to the page as displayed,
+    so a box drawn around some text must land where that text's highlight
+    lands, not at the same fractions of the unrotated page."""
+    import fitz
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path, (text_rect,) = _make_pdf(tmpdir)
+        doc = fitz.open(path)
+        doc[0].set_rotation(90)
+        doc.saveIncr()
+        page = doc[0]
+        shown = page.search_for(SENTENCE)[0] * page.rotation_matrix
+        w, h = page.rect.width, page.rect.height
+        doc.close()
+
+        result = build_area_position_data(
+            path, 1, shown.x0 / w, shown.y0 / h, shown.width / w, shown.height / h
+        )
+
+        assert "error" not in result
+        _assert_rects_close(result["rects"], [text_rect])
+
+
+def test_build_note_position_rotated_page():
+    """A note placed at a displayed point on a /Rotate 90 page is centered on
+    that point in the stored (unrotated) PDF space."""
+    import fitz
+
+    from zotero_mcp.pdf_utils import build_note_position_data
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path, (text_rect,) = _make_pdf(tmpdir)
+        doc = fitz.open(path)
+        doc[0].set_rotation(90)
+        doc.saveIncr()
+        page = doc[0]
+        shown = page.search_for(SENTENCE)[0] * page.rotation_matrix
+        w, h = page.rect.width, page.rect.height
+        doc.close()
+
+        result = build_note_position_data(path, 1, shown.x0 / w, shown.y0 / h)
+
+        (rect,) = result["rects"]
+        assert rect[2] - rect[0] == pytest.approx(22) and rect[3] - rect[1] == pytest.approx(22)
+        centre = ((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
+        corners = [(text_rect[0], text_rect[1]), (text_rect[0], text_rect[3]),
+                   (text_rect[2], text_rect[1]), (text_rect[2], text_rect[3])]
+        assert any(centre == pytest.approx(c, abs=0.5) for c in corners)

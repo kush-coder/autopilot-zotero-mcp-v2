@@ -1,0 +1,89 @@
+# Troubleshooting
+
+## General issues
+
+- **No results found**: Ensure Zotero is running and the local API is enabled. You need to toggle on `Allow other applications on this computer to communicate with Zotero` in Zotero preferences.
+- **Can't connect to library**: Check your API key and library ID if using the web API, and that the key has the permissions you need.
+- **Full text not available**: Make sure you're using Zotero 7+ for local full-text access.
+- **Claude Desktop can't find the `zotero-mcp` command**: use the absolute path instead (run `zotero-mcp setup-info` or `which zotero-mcp` to find it) — GUI apps don't always inherit your shell `PATH`.
+- **Settings seem ignored**: environment variables set in the shell you launch a client from override the values in its config file.
+- **Where to look for errors**: the Claude Desktop logs, or the MCP server's own output.
+- **Installation/search option switching issues**: Database problems from changing install methods or search options can often be resolved with `zotero-mcp update-db --force-rebuild` (see [Database issues](#database-issues)).
+
+<a id="local-library-limitations"></a>
+
+### Local library limitations
+
+**On Zotero 10 or newer** the local API accepts writes. Run `zotero-mcp authorize-local`
+once, choose "Always Allow" in the dialog Zotero shows, and tagging, item edits, notes,
+collections and file attachments all work against the local library with no cloud
+account. See [Local write support](configuration.md#local-write-support).
+
+**On Zotero 9 and older** the local API is read-only, so library modifications will not
+work over the local connection alone. Set `ZOTERO_API_KEY` and `ZOTERO_LIBRARY_ID`
+alongside `ZOTERO_LOCAL=true` — the server then reads locally and writes through the web
+API ("hybrid mode"), which is what makes tagging and the rest behave as expected.
+
+<a id="semantic-search"></a>
+
+### `421 Misdirected Request` or `403 Forbidden Origin` over HTTP
+
+The `streamable-http` and `sse` transports check the `Host` and `Origin` headers so that a web page cannot reach a server on `localhost` through DNS rebinding. On a loopback bind, requests must name `localhost`, `127.0.0.1` or `[::1]`. Local clients, `mcp-remote` and VPNs that connect to `localhost` are not affected. A tunnel or reverse proxy (ngrok, Cloudflare Tunnel, nginx) that forwards its own public hostname, or a hostname alias for 127.0.0.1, gets a 421, and a browser page from another origin gets a 403.
+
+Allow the hostname (a JSON list) and restart:
+
+```bash
+export FASTMCP_HTTP_ALLOWED_HOSTS='["zotero.example.com"]'
+# browser clients on another origin:
+export FASTMCP_HTTP_ALLOWED_ORIGINS='["https://app.example.com"]'
+```
+
+Or have the proxy rewrite `Host` to `localhost:<port>`. To switch the check off entirely, set `FASTMCP_HTTP_HOST_ORIGIN_PROTECTION=false`; only do that on a trusted machine. Servers bound to `0.0.0.0` (for example in Docker) are not covered by the default check; they need `ZOTERO_MCP_AUTH_TOKEN` to start at all (see [HTTP authentication](configuration.md#http-authentication-and-network-access)), and you can add `FASTMCP_HTTP_HOST_ORIGIN_PROTECTION=true` together with `FASTMCP_HTTP_ALLOWED_HOSTS`.
+
+## Semantic search issues
+
+- **"Missing required environment variables" when running update-db**: Run `zotero-mcp setup` to configure your environment, or the CLI will automatically load settings from your MCP client config (e.g., Claude Desktop)
+- **ChromaDB / stale embedding model errors**: If you changed embedding models and see 404 errors (e.g., `text-embedding-004 is not found`), run `zotero-mcp update-db --force-rebuild` to recreate the collection with your current model. If that doesn't work, delete `~/.config/zotero-mcp/chroma_db/` and rebuild.
+- **Database update takes long**: By default, `update-db` indexes metadata plus the text Zotero has already extracted for your PDFs (set `semantic_search.include_fulltext` to `false` for metadata only). For comprehensive indexing that extracts text from the PDF files themselves, use the `--fulltext` flag. Use `--limit` parameter for testing: `zotero-mcp update-db --limit 100` (a `--limit` run does not advance the sync watermark, so a later plain `update-db` still picks up everything it skipped)
+- **Semantic search returns no results**: Ensure the database is initialized with `zotero-mcp update-db` and check status with `zotero-mcp db-status`
+- **Limited search quality**: For better semantic search results, use `zotero-mcp update-db --fulltext` to index full-text content (requires local Zotero setup)
+- **OpenAI/Gemini API errors**: Verify your API keys are correctly set and have sufficient credits/quota
+- **Ollama `Read timed out`**: see the `timeout` and `request_batch_size` settings in [Semantic search](semantic-search.md#ollama)
+- **`Error loading hnsw index` on Windows**: your user folder name has non-ASCII characters. Move the index to an ASCII path with `persist_directory`, see [Index location](semantic-search.md#index-location)
+
+<a id="database-issues"></a>
+
+### Database issues
+
+Switching installs or install methods (sometimes to deal with failed installs), as well as toggling between search options, can sometimes lead to database problems. These can frequently be solved with:
+
+```bash
+zotero-mcp update-db --force-rebuild
+```
+
+A forced rebuild deletes the whole ChromaDB collection and re-embeds every item in the active library from scratch. With OpenAI or Gemini embeddings that is billed again in full, and it takes as long as the first build. If the index also holds other libraries (or documents with no library attribution), the command refuses and asks for `--allow-mass-deletion`; passing that flag drops those documents permanently. Back up `~/.config/zotero-mcp/chroma_db/` first, and try a plain `zotero-mcp update-db` before rebuilding.
+
+<a id="repairing-an-unreadable-index"></a>
+
+### Repairing an unreadable index
+
+When ChromaDB cannot read the index, `db-status` and `zotero_get_search_database_status` say the index is unreadable and show ChromaDB's error (for example `Failed to apply logs to the metadata segment`), the size of the index, the last successful update and when the index was last written. A last write after the last successful update means an update was most likely interrupted part way through. `update-db` and semantic search stop with the same explanation instead of failing later with ChromaDB's error alone. `repair-db` rebuilds the index from its own files without calling the embedding provider:
+
+```bash
+zotero-mcp repair-db --dry-run   # report what can be recovered; changes nothing
+zotero-mcp repair-db             # rebuild the index
+zotero-mcp update-db --fulltext  # embed the items repair-db left out
+```
+
+It reads the vectors from the index's HNSW files and the documents and metadata from `chroma.sqlite3`, and keeps an item only if all of its chunks have a document and a vector and their metadata agree. The rest are left out and listed in a report next to the index. The new index replaces the old one, which is kept as `chroma_db.broken-<timestamp>`; delete it once search works. The rebuild needs free disk space of about the size of the old index. `update-db --fulltext` skips items that are already indexed, so it only embeds the ones left out. Without `--fulltext`, `update-db` reads only items changed since the last sync and does not pick them up.
+
+`repair-db` cannot help when the vector files are missing or in a format it does not know (it says so); rebuild with `update-db --force-rebuild` then. On an unreadable index, `--force-rebuild` renames it to `chroma_db.broken-<timestamp>` and builds a new one, so nothing is deleted.
+
+Stop any running zotero-mcp server (quit the MCP client that started it) before repairing or rebuilding. A server that has the index open keeps the old files, and opening a damaged index makes ChromaDB try again to apply its pending writes to it.
+
+## Update issues
+
+- **Update command fails**: Check your internet connection and try `zotero-mcp update --force`
+- **Configuration lost after update**: The update process preserves configs automatically, but check `~/.config/zotero-mcp/` for backup files
+
+For more help, try the [discussions](https://github.com/54yyyu/zotero-mcp/discussions) or the [Discord](https://discord.gg/BvgjbcBUqg).

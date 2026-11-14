@@ -1,0 +1,197 @@
+"""ChatGPT connector tool functions (search & fetch)."""
+
+import json
+import os
+import uuid
+from pathlib import Path
+
+from zotero_mcp import library as _library
+from zotero_mcp import utils as _utils
+from zotero_mcp._app import mcp
+from zotero_mcp._context import Context
+from zotero_mcp.client import with_zotero_api_lock
+from zotero_mcp.tools.retrieval import get_item_fulltext
+
+# These are required for ChatGPT custom MCP servers via web "connectors"
+# specific tools required are "search" and "fetch"
+# See: https://platform.openai.com/docs/mcp
+
+@mcp.tool(
+    name="search",
+    description=(
+        "ChatGPT custom connector SEARCH endpoint — name is REQUIRED by "
+        "the MCP-over-web spec (see platform.openai.com/docs/mcp); "
+        "do not rename. Not intended for general MCP clients — in Claude "
+        "or other regular MCP contexts use zotero_semantic_search or "
+        "zotero_search_items instead, which return richer markdown. "
+        "Performs semantic search over the active Zotero library (keyword "
+        "search when the semantic index is unavailable or finds nothing) and "
+        "returns a JSON string {\"results\":[{\"id\",\"title\",\"url\"}, "
+        "...]} matching the ChatGPT connector citation UI. URLs are "
+        "zotero://select/items/<key> deep-links. "
+        "query: topic string; natural language works (embedding match). "
+        "No limit parameter — fixed at 10 per the connector UI's "
+        "expected result-set size. "
+        "SILENT FALLBACK: any error returns {\"results\":[]} rather "
+        "than raising, to keep the ChatGPT connector stable. "
+        "Example (agent-invoked): search(query='mindfulness-based "
+        "therapy')."
+    )
+)
+@with_zotero_api_lock
+def chatgpt_connector_search(
+    query: str,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Returns a JSON-encoded string with shape {"results": [{"id","title","url"}, ...]}.
+    The MCP runtime wraps this string as a single text content item.
+    """
+    default_limit = 10
+    # (key, title) pairs. Semantic first; a missing extra, an unbuilt index or
+    # an empty answer all fall through to keyword search, so a core install
+    # still gives the connector something to cite.
+    hits: list[tuple[str, str]] = []
+    try:
+        from zotero_mcp.semantic_search import create_semantic_search
+
+        config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
+        search = create_semantic_search(str(config_path))
+        results = search.search(query=query, limit=default_limit, filters=None) or {}
+        for r in results.get("results", []):
+            data = (r.get("zotero_item") or {}).get("data", {})
+            hits.append((r.get("item_key") or "", data.get("title", "")))
+    except Exception as e:
+        ctx.info(f"Semantic search unavailable, using keyword search: {e}")
+    if not hits:
+        try:
+            items = _library.get_library_backend().search_items(
+                query, qmode="everything", limit=default_limit
+            )
+            hits = [(i.get("key", ""), i.get("data", {}).get("title", "")) for i in items]
+        except Exception as e:
+            ctx.error(f"Error in search wrapper: {str(e)}")
+
+    result_list = [
+        {
+            "id": key or uuid.uuid4().hex[:8],
+            "title": title or (f"Zotero Item {key}" if key else "Zotero Item"),
+            "url": f"zotero://select/items/{key}" if key else "",
+        }
+        for key, title in hits
+    ]
+    return json.dumps({"results": result_list}, separators=(",", ":"))
+
+
+@mcp.tool(
+    name="fetch",
+    description=(
+        "ChatGPT custom connector FETCH endpoint — name is REQUIRED by "
+        "the MCP-over-web spec (see platform.openai.com/docs/mcp); "
+        "do not rename. Not intended for general MCP clients — in Claude "
+        "or other regular MCP contexts use zotero_get_item_fulltext and "
+        "zotero_get_item_metadata, which return richer markdown. "
+        "Retrieves a single Zotero item and returns a JSON envelope "
+        "{\"id\",\"title\",\"text\",\"url\",\"metadata\":{...}} matching "
+        "the ChatGPT connector citation viewer. "
+        "id: an 8-char Zotero item key — typically from a previous "
+        "`search` call. Blank/missing returns an empty envelope (no "
+        "error). "
+        "url field: Zotero web-library URL when ZOTERO_LIBRARY_ID is "
+        "set; otherwise a zotero://select/items/<key> deep-link. "
+        "text field: extracted fulltext via the same path as "
+        "zotero_get_item_fulltext; if none can be extracted, falls back "
+        "to title + authors + abstract so the connector isn't blank. "
+        "metadata field: itemType, date, DOI, authors, tags, both URLs. "
+        "SILENT FALLBACK: errors return an envelope with "
+        "{\"metadata\":{\"error\":…}} rather than raising, to keep the "
+        "ChatGPT connector stable. "
+        "Example (agent-invoked): fetch(id='RTKZQI8E')."
+    )
+)
+@with_zotero_api_lock
+def connector_fetch(
+    id: str,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Returns a JSON-encoded string with shape {"id","title","text","url","metadata":{...}}.
+    The MCP runtime wraps this string as a single text content item.
+    """
+    try:
+        item_key = (id or "").strip()
+        if not item_key:
+            return json.dumps({
+                "id": id,
+                "title": "",
+                "text": "",
+                "url": "",
+                "metadata": {"error": "missing item key"}
+            }, separators=(",", ":"))
+
+        # Fetch item metadata for title and context
+        item = _library.get_library_backend().get_item(item_key)
+        data = item.get("data", {}) if item else {}
+
+        title = data.get("title", f"Zotero Item {item_key}")
+        zotero_url = f"zotero://select/items/{item_key}"
+        # Prefer web URL for connectors; fall back to zotero:// if unknown
+        lib_type = (os.getenv("ZOTERO_LIBRARY_TYPE", "user") or "user").lower()
+        lib_id = os.getenv("ZOTERO_LIBRARY_ID", "")
+        if lib_type not in ["user", "group"]:
+            lib_type = "user"
+        web_url = f"https://www.zotero.org/{'users' if lib_type=='user' else 'groups'}/{lib_id}/items/{item_key}" if lib_id else ""
+        url = web_url or zotero_url
+
+        # Use existing tool to get best-effort fulltext/markdown
+        text_md = get_item_fulltext(item_key=item_key, ctx=ctx)
+        # Extract the actual full text section if present, else keep as-is
+        text_clean = text_md
+        try:
+            marker = "## Full Text"
+            pos = text_md.find(marker)
+            if pos >= 0:
+                text_clean = text_md[pos + len(marker):].lstrip("\n #")
+        except Exception:
+            pass
+        if (not text_clean or len(text_clean.strip()) < 40) and data:
+            abstract = data.get("abstractNote", "")
+            creators = data.get("creators", [])
+            byline = _utils.format_creators(creators)
+            text_clean = (f"{title}\n\n" + (f"Authors: {byline}\n" if byline else "") +
+                          (f"Abstract:\n{abstract}" if abstract else "")) or text_md
+
+        metadata = {
+            "itemType": data.get("itemType", ""),
+            "date": data.get("date", ""),
+            "key": item_key,
+            "doi": data.get("DOI", ""),
+            "isbn": data.get("ISBN", ""),
+            "issn": data.get("ISSN", ""),
+            "publisher": data.get("publisher", ""),
+            "place": data.get("place", ""),
+            "authors": _utils.format_creators(data.get("creators", [])),
+            "tags": [t.get("tag", "") for t in (data.get("tags", []) or [])],
+            "zotero_url": zotero_url,
+            "web_url": web_url,
+            "source": "zotero-mcp"
+        }
+
+        return json.dumps({
+            "id": item_key,
+            "title": title,
+            "text": text_clean,
+            "url": url,
+            "metadata": metadata
+        }, separators=(",", ":"))
+    except Exception as e:
+        ctx.error(f"Error in fetch wrapper: {str(e)}")
+        return json.dumps({
+            "id": id,
+            "title": "",
+            "text": "",
+            "url": "",
+            "metadata": {"error": str(e)}
+        }, separators=(",", ":"))
